@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from lane import process_video_frames, resolve_default_video_path
+from lane import default_roi_points, process_video_frames, resolve_default_video_path
 
 st.set_page_config(page_title="Lane Detection", layout="wide")
 
@@ -64,15 +64,16 @@ def main():
         return
 
     frame_height, frame_width = frame.shape[:2]
+    default_roi = default_roi_points(frame_width, frame_height).astype(int)
     st.sidebar.header("Lane ROI")
     st.sidebar.caption("Move these points until the trapezoid sits on the road lanes.")
-    top_left_x = st.sidebar.slider("Top-left X", min_value=0, max_value=frame_width - 1, value=min(274, frame_width - 1))
-    top_left_y = st.sidebar.slider("Top-left Y", min_value=0, max_value=frame_height - 1, value=min(184, frame_height - 1))
-    top_right_x = st.sidebar.slider("Top-right X", min_value=0, max_value=frame_width - 1, value=min(371, frame_width - 1))
-    top_right_y = st.sidebar.slider("Top-right Y", min_value=0, max_value=frame_height - 1, value=min(184, frame_height - 1))
-    bottom_left_x = st.sidebar.slider("Bottom-left X", min_value=0, max_value=frame_width - 1, value=0)
-    bottom_right_x = st.sidebar.slider("Bottom-right X", min_value=0, max_value=frame_width - 1, value=min(575, frame_width - 1))
-    bottom_y = st.sidebar.slider("Bottom Y", min_value=0, max_value=frame_height - 1, value=min(337, frame_height - 1))
+    top_left_x = st.sidebar.slider("Top-left X", min_value=0, max_value=frame_width - 1, value=int(default_roi[0][0]))
+    top_left_y = st.sidebar.slider("Top-left Y", min_value=0, max_value=frame_height - 1, value=int(default_roi[0][1]))
+    top_right_x = st.sidebar.slider("Top-right X", min_value=0, max_value=frame_width - 1, value=int(default_roi[3][0]))
+    top_right_y = st.sidebar.slider("Top-right Y", min_value=0, max_value=frame_height - 1, value=int(default_roi[3][1]))
+    bottom_left_x = st.sidebar.slider("Bottom-left X", min_value=0, max_value=frame_width - 1, value=int(default_roi[1][0]))
+    bottom_right_x = st.sidebar.slider("Bottom-right X", min_value=0, max_value=frame_width - 1, value=int(default_roi[2][0]))
+    bottom_y = st.sidebar.slider("Bottom Y", min_value=0, max_value=frame_height - 1, value=int(default_roi[1][1]))
 
     roi_points = build_roi_points(
         top_left_x,

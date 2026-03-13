@@ -70,8 +70,8 @@ def mag_thresh(image, sobel_kernel=3, thresh=(0, 255)):
   # from top to bottom x number of pixels from left to right
   mag = np.sqrt(sobelx ** 2 + sobely ** 2)
  
-  # Return a 2D array that contains 0s and 1s   
-  return binary_array(mag, thresh)
+  # Return a 2D array that contains 0s and 1s where strong gradients exist.
+  return binary_array(mag, thresh, value=1)
  
 def sobel(img_channel, orient='x', sobel_kernel=3):
   """
@@ -109,3 +109,34 @@ def threshold(channel, thresh=(128,255), thresh_type=cv2.THRESH_BINARY):
   # If pixel intensity is greater than thresh[0], make that value
   # white (255), else set it to black (0)
   return cv2.threshold(channel, thresh[0], thresh[1], thresh_type)
+
+
+def overlay_edge_preview(frame, edge_mask, size=(320, 180), margin=16):
+  """
+  Draw a small edge-detection preview on top of a BGR video frame.
+
+  :param frame: BGR image used as the main output
+  :param edge_mask: Single-channel mask from the edge / lane threshold stage
+  :param size: Width and height of the preview inset
+  :param margin: Padding from the top-right corner
+  :return: BGR frame with inset preview
+  """
+  if frame is None or edge_mask is None:
+    return frame
+
+  output = frame.copy()
+  preview = edge_mask.astype(np.uint8)
+  if preview.ndim == 2:
+    preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+
+  preview = cv2.resize(preview, size, interpolation=cv2.INTER_NEAREST)
+  top = margin
+  left = max(output.shape[1] - size[0] - margin, 0)
+  bottom = min(top + size[1], output.shape[0])
+  right = min(left + size[0], output.shape[1])
+
+  output[top:bottom, left:right] = preview[: bottom - top, : right - left]
+  cv2.rectangle(output, (left, top), (right, bottom), (255, 255, 255), 2)
+  cv2.putText(output, 'Edge mask', (left + 10, top + 24), cv2.FONT_HERSHEY_SIMPLEX,
+              0.6, (255, 255, 255), 2, cv2.LINE_AA)
+  return output

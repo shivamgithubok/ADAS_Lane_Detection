@@ -1,226 +1,183 @@
 from pathlib import Path
+from typing import Iterator
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 
 import edge_detection as edge
 
-DEFAULT_IMAGE_PATH = "original_lane_detection_5.jpg"
-DEFAULT_VIDEO_CANDIDATES = ("video.mp4", "project_video.mp4")
+
+def resolve_default_video_path() -> Path | None:
+    for candidate in ("video.mp4","project_video.mp4", "video.avi", "video.mov"):
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def default_roi_points(frame_width: int, frame_height: int) -> np.ndarray:
+    return np.float32([
+        (int(frame_width * 0.46), int(frame_height * 0.63)),  # top-left  (narrower apex)
+        (int(frame_width * 0.14), int(frame_height * 0.95)),  # bottom-left
+        (int(frame_width * 0.88), int(frame_height * 0.95)),  # bottom-right
+        (int(frame_width * 0.56), int(frame_height * 0.63)),  # top-right
+    ])
 
 
 class Lane:
-    """
-    Represents a lane on a road.
-    """
+    def __init__(self, orig_frame: np.ndarray, roi_points: np.ndarray | None = None):
+        if orig_frame is None or orig_frame.size == 0:
+            raise ValueError("orig_frame must be a valid image frame")
 
-    def __init__(self, orig_frame, roi_points=None):
         self.orig_frame = orig_frame
-        self.lane_line_markings = None
-        self.warped_frame = None
-        self.transformation_matrix = None
-        self.inv_transformation_matrix = None
+        self.height, self.width = self.orig_frame.shape[:2]
+        self.orig_image_size = (self.width, self.height)
 
-        self.orig_image_size = self.orig_frame.shape[::-1][1:]
-        self.width = self.orig_image_size[0]
-        self.height = self.orig_image_size[1]
-
-        default_roi_points = np.float32(
-            [
-                (274, 184),      # top-left
-                (0, 337),        # bottom-left
-                (575, 337),      # bottom-right
-                (371, 184),      # top-right
-            ]
+        self.roi_points = (
+            np.float32(roi_points)
+            if roi_points is not None
+            else default_roi_points(self.width, self.height)
         )
-        self.roi_points = np.float32(roi_points) if roi_points is not None else default_roi_points
-
         self.padding = int(0.25 * self.width)
         self.desired_roi_points = np.float32(
             [
                 [self.padding, 0],
-                [self.padding, self.orig_image_size[1]],
-                [self.orig_image_size[0] - self.padding, self.orig_image_size[1]],
-                [self.orig_image_size[0] - self.padding, 0],
+                [self.padding, self.height],
+                [self.width - self.padding, self.height],
+                [self.width - self.padding, 0],
             ]
         )
 
-        self.histogram = None
-        self.no_of_windows = 10
-        self.margin = int((1 / 12) * self.width)
-        self.minpix = int((1 / 24) * self.width)
+        self.lane_line_markings: np.ndarray | None = None
+        self.warped_frame: np.ndarray | None = None
+        self.transformation_matrix: np.ndarray | None = None
+        self.inv_transformation_matrix: np.ndarray | None = None
+        self.histogram: np.ndarray | None = None
 
-        self.left_fit = None
-        self.right_fit = None
+        self.no_of_windows = 10
+        self.margin = max(40, int(self.width / 12))
+        self.minpix = max(20, int(self.width / 24))
+
+        self.left_fit: np.ndarray | None = None
+        self.right_fit: np.ndarray | None = None
         self.left_lane_inds = None
         self.right_lane_inds = None
-        self.ploty = None
-        self.left_fitx = None
-        self.right_fitx = None
-        self.leftx = None
-        self.rightx = None
-        self.lefty = None
-        self.righty = None
+        self.ploty: np.ndarray | None = None
+        self.left_fitx: np.ndarray | None = None
+        self.right_fitx: np.ndarray | None = None
+        self.leftx: np.ndarray | None = None
+        self.rightx: np.ndarray | None = None
+        self.lefty: np.ndarray | None = None
+        self.righty: np.ndarray | None = None
 
         self.YM_PER_PIX = 10.0 / 1000
         self.XM_PER_PIX = 3.7 / 781
 
-        self.left_curvem = None
-        self.right_curvem = None
-        self.center_offset = None
+        self.left_curvem: float | None = None
+        self.right_curvem: float | None = None
+        self.center_offset: float | None = None
 
-    def calculate_car_position(self, print_to_terminal=False):
-        car_location = self.orig_frame.shape[1] / 2
-        height = self.orig_frame.shape[0]
-        bottom_left = self.left_fit[0] * height**2 + self.left_fit[1] * height + self.left_fit[2]
-        bottom_right = (
-            self.right_fit[0] * height**2 + self.right_fit[1] * height + self.right_fit[2]
+    def get_line_markings(self, frame: np.ndarray | None = None) -> np.ndarray:
+        frame = self.orig_frame if frame is None else frame
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lightness = hls[:, :, 1]
+        _, bright_binary = edge.threshold(lightness, thresh=(150, 255))
+        _, white_binary = edge.threshold(gray, thresh=(170, 255))
+        white_mask = cv2.bitwise_and(bright_binary, white_binary)
+
+        yellow_mask = cv2.inRange(
+            hsv,
+            np.array([12, 70, 70], dtype=np.uint8),
+            np.array([40, 255, 255], dtype=np.uint8),
         )
 
-        center_lane = (bottom_right - bottom_left) / 2 + bottom_left
-        center_offset = (abs(car_location) - abs(center_lane)) * self.XM_PER_PIX * 100
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobelx = np.absolute(sobelx)
+        scaled_sobel = np.uint8(255 * sobelx / max(np.max(sobelx), 1))
+        _, gradient_binary = edge.threshold(scaled_sobel, thresh=(25, 255))
+        gradient_mask = cv2.bitwise_and(gradient_binary, cv2.bitwise_or(bright_binary, yellow_mask))
 
-        if print_to_terminal:
-            print(f"{center_offset}cm")
+        combined_mask = cv2.bitwise_or(cv2.bitwise_or(white_mask, yellow_mask), gradient_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        self.lane_line_markings = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        return self.lane_line_markings
 
-        self.center_offset = center_offset
-        return center_offset
-
-    def calculate_curvature(self, print_to_terminal=False):
-        y_eval = np.max(self.ploty)
-        left_fit_cr = np.polyfit(self.lefty * self.YM_PER_PIX, self.leftx * self.XM_PER_PIX, 2)
-        right_fit_cr = np.polyfit(self.righty * self.YM_PER_PIX, self.rightx * self.XM_PER_PIX, 2)
-
-        left_curvem = ((1 + (2 * left_fit_cr[0] * y_eval * self.YM_PER_PIX + left_fit_cr[1]) ** 2) ** 1.5) / abs(
-            2 * left_fit_cr[0]
-        )
-        right_curvem = (
-            (1 + (2 * right_fit_cr[0] * y_eval * self.YM_PER_PIX + right_fit_cr[1]) ** 2) ** 1.5
-        ) / abs(2 * right_fit_cr[0])
-
-        if print_to_terminal:
-            print(left_curvem, "m", right_curvem, "m")
-
-        self.left_curvem = left_curvem
-        self.right_curvem = right_curvem
-        return left_curvem, right_curvem
-
-    def calculate_histogram(self, frame=None, plot=True):
+    def perspective_transform(self, frame: np.ndarray | None = None) -> np.ndarray:
+        frame = self.lane_line_markings if frame is None else frame
         if frame is None:
-            frame = self.warped_frame
+            raise ValueError("lane line markings must be created before perspective transform")
 
-        self.histogram = np.sum(frame[int(frame.shape[0] / 2) :, :], axis=0)
+        self.transformation_matrix = cv2.getPerspectiveTransform(
+            self.roi_points, self.desired_roi_points
+        )
+        self.inv_transformation_matrix = cv2.getPerspectiveTransform(
+            self.desired_roi_points, self.roi_points
+        )
+        self.warped_frame = cv2.warpPerspective(
+            frame,
+            self.transformation_matrix,
+            self.orig_image_size,
+            flags=cv2.INTER_LINEAR,
+        )
+        _, binary_warped = cv2.threshold(self.warped_frame, 127, 255, cv2.THRESH_BINARY)
+        self.warped_frame = binary_warped
+        return self.warped_frame
 
-        if plot:
-            figure, (ax1, ax2) = plt.subplots(2, 1)
-            figure.set_size_inches(10, 5)
-            ax1.imshow(frame, cmap="gray")
-            ax1.set_title("Warped Binary Frame")
-            ax2.plot(self.histogram)
-            ax2.set_title("Histogram Peaks")
-            plt.show()
+    def calculate_histogram(self, frame: np.ndarray | None = None) -> np.ndarray:
+        frame = self.warped_frame if frame is None else frame
+        if frame is None:
+            raise ValueError("warped frame must exist before histogram calculation")
 
+        self.histogram = np.sum(frame[frame.shape[0] // 2 :, :], axis=0)
         return self.histogram
 
-    def display_curvature_offset(self, frame=None, plot=False):
-        image_copy = self.orig_frame.copy() if frame is None else frame
+    def histogram_peak(self) -> tuple[int, int]:
+        if self.histogram is None:
+            raise ValueError("histogram must be calculated first")
 
-        cv2.putText(
-            image_copy,
-            f"Curve Radius: {((self.left_curvem + self.right_curvem) / 2):.2f} m",
-            (int((5 / 600) * self.width), int((20 / 338) * self.height)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            float((0.5 / 600) * self.width),
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            image_copy,
-            f"Center Offset: {self.center_offset:.2f} cm",
-            (int((5 / 600) * self.width), int((40 / 338) * self.height)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            float((0.5 / 600) * self.width),
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        midpoint = self.histogram.shape[0] // 2
+        leftx_base = int(np.argmax(self.histogram[:midpoint]))
+        rightx_base = int(np.argmax(self.histogram[midpoint:]) + midpoint)
+        return leftx_base, rightx_base
 
-        if plot:
-            cv2.imshow("Image with Curvature and Offset", image_copy)
-
-        return image_copy
-
-    def get_lane_line_previous_window(self, left_fit, right_fit, plot=False):
-        margin = self.margin
+    def _fit_from_lane_indices(self, left_lane_inds, right_lane_inds) -> tuple[np.ndarray, np.ndarray]:
         nonzero = self.warped_frame.nonzero()
         nonzeroy = np.array(nonzero[0])
         nonzerox = np.array(nonzero[1])
 
-        left_lane_inds = (
-            (nonzerox > (left_fit[0] * (nonzeroy**2) + left_fit[1] * nonzeroy + left_fit[2] - margin))
-            & (nonzerox < (left_fit[0] * (nonzeroy**2) + left_fit[1] * nonzeroy + left_fit[2] + margin))
-        )
-        right_lane_inds = (
-            (nonzerox > (right_fit[0] * (nonzeroy**2) + right_fit[1] * nonzeroy + right_fit[2] - margin))
-            & (nonzerox < (right_fit[0] * (nonzeroy**2) + right_fit[1] * nonzeroy + right_fit[2] + margin))
-        )
+        leftx = nonzerox[left_lane_inds]
+        lefty = nonzeroy[left_lane_inds]
+        rightx = nonzerox[right_lane_inds]
+        righty = nonzeroy[right_lane_inds]
 
+        if len(leftx) < 3 or len(rightx) < 3:
+            raise ValueError("insufficient lane pixels detected")
+
+        self.leftx = leftx
+        self.lefty = lefty
+        self.rightx = rightx
+        self.righty = righty
+
+        self.left_fit = np.polyfit(lefty, leftx, 2)
+        self.right_fit = np.polyfit(righty, rightx, 2)
         self.left_lane_inds = left_lane_inds
         self.right_lane_inds = right_lane_inds
+        self._update_plot_points()
+        return self.left_fit, self.right_fit
 
-        self.leftx = nonzerox[left_lane_inds]
-        self.lefty = nonzeroy[left_lane_inds]
-        self.rightx = nonzerox[right_lane_inds]
-        self.righty = nonzeroy[right_lane_inds]
-
-        self.left_fit = np.polyfit(self.lefty, self.leftx, 2)
-        self.right_fit = np.polyfit(self.righty, self.rightx, 2)
-
-        self.ploty = np.linspace(0, self.warped_frame.shape[0] - 1, self.warped_frame.shape[0])
+    def _update_plot_points(self) -> None:
+        self.ploty = np.linspace(0, self.height - 1, self.height)
         self.left_fitx = self.left_fit[0] * self.ploty**2 + self.left_fit[1] * self.ploty + self.left_fit[2]
         self.right_fitx = self.right_fit[0] * self.ploty**2 + self.right_fit[1] * self.ploty + self.right_fit[2]
 
-        if plot:
-            out_img = np.dstack((self.warped_frame, self.warped_frame, self.warped_frame)) * 255
-            window_img = np.zeros_like(out_img)
-            out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
-            out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+    def get_lane_line_indices_sliding_windows(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.warped_frame is None:
+            raise ValueError("warped frame must exist before sliding window search")
 
-            left_line_window1 = np.array([np.transpose(np.vstack([self.left_fitx - margin, self.ploty]))])
-            left_line_window2 = np.array(
-                [np.flipud(np.transpose(np.vstack([self.left_fitx + margin, self.ploty])))]
-            )
-            right_line_window1 = np.array([np.transpose(np.vstack([self.right_fitx - margin, self.ploty]))])
-            right_line_window2 = np.array(
-                [np.flipud(np.transpose(np.vstack([self.right_fitx + margin, self.ploty])))]
-            )
-
-            cv2.fillPoly(window_img, np.int_([np.hstack((left_line_window1, left_line_window2))]), (0, 255, 0))
-            cv2.fillPoly(
-                window_img, np.int_([np.hstack((right_line_window1, right_line_window2))]), (0, 255, 0)
-            )
-            result = cv2.addWeighted(out_img, 1, window_img, 0.3, 0)
-
-            figure, (ax1, ax2, ax3) = plt.subplots(3, 1)
-            figure.set_size_inches(10, 10)
-            figure.tight_layout(pad=3.0)
-            ax1.imshow(cv2.cvtColor(self.orig_frame, cv2.COLOR_BGR2RGB))
-            ax2.imshow(self.warped_frame, cmap="gray")
-            ax3.imshow(result)
-            ax3.plot(self.left_fitx, self.ploty, color="yellow")
-            ax3.plot(self.right_fitx, self.ploty, color="yellow")
-            ax1.set_title("Original Frame")
-            ax2.set_title("Warped Frame")
-            ax3.set_title("Warped Frame With Search Window")
-            plt.show()
-
-    def get_lane_line_indices_sliding_windows(self, plot=False):
-        margin = self.margin
-        frame_sliding_window = self.warped_frame.copy()
-        window_height = int(self.warped_frame.shape[0] / self.no_of_windows)
-
+        window_height = self.warped_frame.shape[0] // self.no_of_windows
         nonzero = self.warped_frame.nonzero()
         nonzeroy = np.array(nonzero[0])
         nonzerox = np.array(nonzero[1])
@@ -232,38 +189,29 @@ class Lane:
         for window in range(self.no_of_windows):
             win_y_low = self.warped_frame.shape[0] - (window + 1) * window_height
             win_y_high = self.warped_frame.shape[0] - window * window_height
-            win_xleft_low = leftx_current - margin
-            win_xleft_high = leftx_current + margin
-            win_xright_low = rightx_current - margin
-            win_xright_high = rightx_current + margin
-
-            cv2.rectangle(
-                frame_sliding_window,
-                (win_xleft_low, win_y_low),
-                (win_xleft_high, win_y_high),
-                (255, 255, 255),
-                2,
-            )
-            cv2.rectangle(
-                frame_sliding_window,
-                (win_xright_low, win_y_low),
-                (win_xright_high, win_y_high),
-                (255, 255, 255),
-                2,
-            )
+            win_xleft_low = leftx_current - self.margin
+            win_xleft_high = leftx_current + self.margin
+            win_xright_low = rightx_current - self.margin
+            win_xright_high = rightx_current + self.margin
 
             good_left_inds = (
-                (nonzeroy >= win_y_low)
-                & (nonzeroy < win_y_high)
-                & (nonzerox >= win_xleft_low)
-                & (nonzerox < win_xleft_high)
-            ).nonzero()[0]
+                (
+                    (nonzeroy >= win_y_low)
+                    & (nonzeroy < win_y_high)
+                    & (nonzerox >= win_xleft_low)
+                    & (nonzerox < win_xleft_high)
+                )
+                .nonzero()[0]
+            )
             good_right_inds = (
-                (nonzeroy >= win_y_low)
-                & (nonzeroy < win_y_high)
-                & (nonzerox >= win_xright_low)
-                & (nonzerox < win_xright_high)
-            ).nonzero()[0]
+                (
+                    (nonzeroy >= win_y_low)
+                    & (nonzeroy < win_y_high)
+                    & (nonzerox >= win_xright_low)
+                    & (nonzerox < win_xright_high)
+                )
+                .nonzero()[0]
+            )
 
             left_lane_inds.append(good_left_inds)
             right_lane_inds.append(good_right_inds)
@@ -273,65 +221,52 @@ class Lane:
             if len(good_right_inds) > self.minpix:
                 rightx_current = int(np.mean(nonzerox[good_right_inds]))
 
-        left_lane_inds = np.concatenate(left_lane_inds)
-        right_lane_inds = np.concatenate(right_lane_inds)
+        return self._fit_from_lane_indices(np.concatenate(left_lane_inds), np.concatenate(right_lane_inds))
 
-        self.leftx = nonzerox[left_lane_inds]
-        self.lefty = nonzeroy[left_lane_inds]
-        self.rightx = nonzerox[right_lane_inds]
-        self.righty = nonzeroy[right_lane_inds]
+    def get_lane_line_previous_window(
+        self, left_fit: np.ndarray, right_fit: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.warped_frame is None:
+            raise ValueError("warped frame must exist before previous-window search")
 
-        self.left_fit = np.polyfit(self.lefty, self.leftx, 2)
-        self.right_fit = np.polyfit(self.righty, self.rightx, 2)
+        nonzero = self.warped_frame.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
 
-        if plot:
-            ploty = np.linspace(0, frame_sliding_window.shape[0] - 1, frame_sliding_window.shape[0])
-            left_fitx = self.left_fit[0] * ploty**2 + self.left_fit[1] * ploty + self.left_fit[2]
-            right_fitx = self.right_fit[0] * ploty**2 + self.right_fit[1] * ploty + self.right_fit[2]
+        left_lane_inds = (
+            (
+                nonzerox
+                > (left_fit[0] * nonzeroy**2 + left_fit[1] * nonzeroy + left_fit[2] - self.margin)
+            )
+            & (
+                nonzerox
+                < (left_fit[0] * nonzeroy**2 + left_fit[1] * nonzeroy + left_fit[2] + self.margin)
+            )
+        )
+        right_lane_inds = (
+            (
+                nonzerox
+                > (right_fit[0] * nonzeroy**2 + right_fit[1] * nonzeroy + right_fit[2] - self.margin)
+            )
+            & (
+                nonzerox
+                < (right_fit[0] * nonzeroy**2 + right_fit[1] * nonzeroy + right_fit[2] + self.margin)
+            )
+        )
 
-            out_img = np.dstack((frame_sliding_window, frame_sliding_window, frame_sliding_window)) * 255
-            out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
-            out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+        return self._fit_from_lane_indices(left_lane_inds, right_lane_inds)
 
-            figure, (ax1, ax2, ax3) = plt.subplots(3, 1)
-            figure.set_size_inches(10, 10)
-            figure.tight_layout(pad=3.0)
-            ax1.imshow(cv2.cvtColor(self.orig_frame, cv2.COLOR_BGR2RGB))
-            ax2.imshow(frame_sliding_window, cmap="gray")
-            ax3.imshow(out_img)
-            ax3.plot(left_fitx, ploty, color="yellow")
-            ax3.plot(right_fitx, ploty, color="yellow")
-            ax1.set_title("Original Frame")
-            ax2.set_title("Warped Frame with Sliding Windows")
-            ax3.set_title("Detected Lane Lines with Sliding Windows")
-            plt.show()
+    def seed_from_previous_fit(self, left_fit: np.ndarray, right_fit: np.ndarray) -> None:
+        self.left_fit = left_fit
+        self.right_fit = right_fit
+        self._update_plot_points()
 
-        return self.left_fit, self.right_fit
+    def overlay_lane_lines(self) -> np.ndarray:
+        if self.warped_frame is None or self.inv_transformation_matrix is None:
+            raise ValueError("perspective transform must run before overlay")
+        if self.left_fitx is None or self.right_fitx is None or self.ploty is None:
+            raise ValueError("lane fit must exist before overlay")
 
-    def get_line_markings(self, frame=None):
-        if frame is None:
-            frame = self.orig_frame
-
-        hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-        _, sxbinary = edge.threshold(hls[:, :, 1], thresh=(120, 255))
-        sxbinary = edge.blur_gaussian(sxbinary, ksize=3)
-        sxbinary = edge.mag_thresh(sxbinary, sobel_kernel=3, thresh=(110, 255))
-
-        s_channel = hls[:, :, 2]
-        _, s_binary = edge.threshold(s_channel, (80, 255))
-        _, r_thresh = edge.threshold(frame[:, :, 2], thresh=(120, 255))
-        rs_binary = cv2.bitwise_and(s_binary, r_thresh)
-
-        self.lane_line_markings = cv2.bitwise_or(rs_binary, sxbinary.astype(np.uint8))
-        return self.lane_line_markings
-
-    def histogram_peak(self):
-        midpoint = int(self.histogram.shape[0] / 2)
-        leftx_base = np.argmax(self.histogram[:midpoint])
-        rightx_base = np.argmax(self.histogram[midpoint:]) + midpoint
-        return leftx_base, rightx_base
-
-    def overlay_lane_lines(self, plot=False):
         warp_zero = np.zeros_like(self.warped_frame).astype(np.uint8)
         color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
 
@@ -339,135 +274,154 @@ class Lane:
         pts_right = np.array([np.flipud(np.transpose(np.vstack([self.right_fitx, self.ploty])))])
         pts = np.hstack((pts_left, pts_right))
 
-        cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0))
+        cv2.fillPoly(color_warp, np.int32([pts]), (0, 255, 0))
         newwarp = cv2.warpPerspective(
             color_warp,
             self.inv_transformation_matrix,
             (self.orig_frame.shape[1], self.orig_frame.shape[0]),
         )
-        result = cv2.addWeighted(self.orig_frame, 1, newwarp, 0.3, 0)
+        return cv2.addWeighted(self.orig_frame, 1, newwarp, 0.3, 0)
 
-        if plot:
-            figure, (ax1, ax2) = plt.subplots(2, 1)
-            figure.set_size_inches(10, 10)
-            figure.tight_layout(pad=3.0)
-            ax1.imshow(cv2.cvtColor(self.orig_frame, cv2.COLOR_BGR2RGB))
-            ax2.imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-            ax1.set_title("Original Frame")
-            ax2.set_title("Original Frame With Lane Overlay")
-            plt.show()
+    def calculate_curvature(self) -> tuple[float, float]:
+        if self.ploty is None or self.leftx is None or self.rightx is None:
+            raise ValueError("lane pixels must exist before curvature calculation")
 
-        return result
+        y_eval = np.max(self.ploty)
+        left_fit_cr = np.polyfit(self.lefty * self.YM_PER_PIX, self.leftx * self.XM_PER_PIX, 2)
+        right_fit_cr = np.polyfit(self.righty * self.YM_PER_PIX, self.rightx * self.XM_PER_PIX, 2)
 
-    def perspective_transform(self, frame=None, plot=False):
-        if frame is None:
-            frame = self.lane_line_markings
-
-        self.transformation_matrix = cv2.getPerspectiveTransform(self.roi_points, self.desired_roi_points)
-        self.inv_transformation_matrix = cv2.getPerspectiveTransform(self.desired_roi_points, self.roi_points)
-
-        self.warped_frame = cv2.warpPerspective(
-            frame, self.transformation_matrix, self.orig_image_size, flags=cv2.INTER_LINEAR
+        self.left_curvem = ((1 + (2 * left_fit_cr[0] * y_eval * self.YM_PER_PIX + left_fit_cr[1]) ** 2) ** 1.5) / max(
+            np.absolute(2 * left_fit_cr[0]),
+            1e-6,
         )
-        _, binary_warped = cv2.threshold(self.warped_frame, 127, 255, cv2.THRESH_BINARY)
-        self.warped_frame = binary_warped
+        self.right_curvem = (
+            (1 + (2 * right_fit_cr[0] * y_eval * self.YM_PER_PIX + right_fit_cr[1]) ** 2) ** 1.5
+        ) / max(np.absolute(2 * right_fit_cr[0]), 1e-6)
 
-        if plot:
-            warped_copy = self.warped_frame.copy()
-            warped_plot = cv2.polylines(warped_copy, np.int32([self.desired_roi_points]), True, (147, 20, 255), 3)
-            while True:
-                cv2.imshow("Warped Image", warped_plot)
-                if cv2.waitKey(0):
-                    break
-            cv2.destroyAllWindows()
+        return self.left_curvem, self.right_curvem
 
-        return self.warped_frame
+    def calculate_car_position(self) -> float:
+        if self.left_fit is None or self.right_fit is None:
+            raise ValueError("lane fit must exist before offset calculation")
 
-    def plot_roi(self, frame=None, plot=False):
-        if not plot:
-            return
+        car_location = self.orig_frame.shape[1] / 2
+        height = self.orig_frame.shape[0]
+        bottom_left = self.left_fit[0] * height**2 + self.left_fit[1] * height + self.left_fit[2]
+        bottom_right = self.right_fit[0] * height**2 + self.right_fit[1] * height + self.right_fit[2]
 
-        if frame is None:
-            frame = self.orig_frame.copy()
+        center_lane = (bottom_right - bottom_left) / 2 + bottom_left
+        self.center_offset = (np.abs(car_location) - np.abs(center_lane)) * self.XM_PER_PIX * 100
+        return self.center_offset
 
-        this_image = cv2.polylines(frame, np.int32([self.roi_points]), True, (147, 20, 255), 3)
-        while True:
-            cv2.imshow("ROI Image", this_image)
-            if cv2.waitKey(0):
-                break
-        cv2.destroyAllWindows()
+    def display_curvature_offset(self, frame: np.ndarray | None = None) -> np.ndarray:
+        image_copy = self.orig_frame.copy() if frame is None else frame.copy()
 
+        curve_text = "Curve Radius: N/A"
+        if self.left_curvem is not None and self.right_curvem is not None:
+            curve_text = f"Curve Radius: {((self.left_curvem + self.right_curvem) / 2):.2f} m"
 
-def process_frame(frame, roi_points=None):
-    lane_obj = Lane(orig_frame=frame, roi_points=roi_points)
-    lane_obj.get_line_markings()
-    lane_obj.perspective_transform(plot=False)
-    lane_obj.calculate_histogram(plot=False)
-    left_fit, right_fit = lane_obj.get_lane_line_indices_sliding_windows(plot=False)
-    lane_obj.get_lane_line_previous_window(left_fit, right_fit, plot=False)
-    frame_with_lane_lines = lane_obj.overlay_lane_lines(plot=False)
-    lane_obj.calculate_curvature(print_to_terminal=False)
-    lane_obj.calculate_car_position(print_to_terminal=False)
-    return lane_obj.display_curvature_offset(frame=frame_with_lane_lines, plot=False)
+        offset_text = "Center Offset: N/A"
+        if self.center_offset is not None:
+            offset_text = f"Center Offset: {self.center_offset:.2f} cm"
+
+        cv2.putText(image_copy, curve_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(image_copy, offset_text, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        return image_copy
 
 
-def resolve_default_video_path():
-    for candidate in DEFAULT_VIDEO_CANDIDATES:
-        path = Path(candidate)
-        if path.exists():
-            return path
-    return None
+class LaneVideoProcessor:
+    def __init__(self, roi_points: np.ndarray | None = None):
+        self.roi_points = np.float32(roi_points) if roi_points is not None else None
+        self.previous_left_fit: np.ndarray | None = None
+        self.previous_right_fit: np.ndarray | None = None
+        self.previous_curvature: tuple[float, float] | None = None
+        self.previous_center_offset: float | None = None
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        lane = Lane(frame, roi_points=self.roi_points)
+        edge_mask = lane.get_line_markings()
+        lane.perspective_transform(edge_mask)
+        lane.calculate_histogram()
+
+        detected = False
+        if self.previous_left_fit is not None and self.previous_right_fit is not None:
+            try:
+                lane.get_lane_line_previous_window(self.previous_left_fit, self.previous_right_fit)
+                detected = True
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                detected = False
+
+        if not detected:
+            try:
+                lane.get_lane_line_indices_sliding_windows()
+                detected = True
+            except (ValueError, np.linalg.LinAlgError):
+                detected = False
+
+        output_frame = frame.copy()
+        if detected:
+            self.previous_left_fit = lane.left_fit.copy()
+            self.previous_right_fit = lane.right_fit.copy()
+            output_frame = lane.overlay_lane_lines()
+
+            try:
+                self.previous_curvature = lane.calculate_curvature()
+            except (ValueError, np.linalg.LinAlgError):
+                self.previous_curvature = None
+
+            try:
+                self.previous_center_offset = lane.calculate_car_position()
+            except ValueError:
+                self.previous_center_offset = None
+
+            output_frame = lane.display_curvature_offset(output_frame)
+        elif self.previous_left_fit is not None and self.previous_right_fit is not None:
+            lane.seed_from_previous_fit(self.previous_left_fit, self.previous_right_fit)
+            output_frame = lane.overlay_lane_lines()
+            lane.left_curvem = self.previous_curvature[0] if self.previous_curvature else None
+            lane.right_curvem = self.previous_curvature[1] if self.previous_curvature else None
+            lane.center_offset = self.previous_center_offset
+            output_frame = lane.display_curvature_offset(output_frame)
+
+        return edge.overlay_edge_preview(output_frame, edge_mask)
 
 
-def process_video_frames(video_path=None, max_frames=None, roi_points=None):
-    resolved_path = Path(video_path) if video_path else resolve_default_video_path()
-    if resolved_path is None or not resolved_path.exists():
-        raise FileNotFoundError("No input video found. Add video.mp4 or keep project_video.mp4 in the project root.")
-
-    capture = cv2.VideoCapture(str(resolved_path))
+def process_video_frames(
+    video_path: str | Path,
+    max_frames: int | None = None,
+    roi_points: np.ndarray | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        raise RuntimeError(f"Unable to open video: {resolved_path}")
+        raise ValueError(f"Unable to open video: {video_path}")
+
+    processor = LaneVideoProcessor(roi_points=roi_points)
+    processed_frames = 0
 
     try:
-        frame_count = 0
         while True:
+            if max_frames is not None and processed_frames >= max_frames:
+                break
+
             success, frame = capture.read()
             if not success:
                 break
 
-            try:
-                processed = process_frame(frame, roi_points=roi_points)
-            except Exception:
-                processed = frame.copy()
-                cv2.putText(
-                    processed,
-                    "Lane detection failed on this frame",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            yield frame, processed
-            frame_count += 1
-            if max_frames is not None and frame_count >= max_frames:
-                break
+            yield frame, processor.process(frame)
+            processed_frames += 1
     finally:
         capture.release()
 
 
-def run_image_demo(image_path=DEFAULT_IMAGE_PATH):
-    original_frame = cv2.imread(str(image_path))
-    if original_frame is None:
-        raise FileNotFoundError(f"Unable to load image: {image_path}")
+def main() -> None:
+    video_path = resolve_default_video_path()
+    if video_path is None:
+        print("No video found. Add video.mp4 or project_video.mp4 to the project root.")
+        return
 
-    processed = process_frame(original_frame)
-    cv2.imshow("Lane Detection", processed)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    for index, _ in enumerate(process_video_frames(video_path=video_path, max_frames=5), start=1):
+        print(f"Processed frame {index}")
 
 
 if __name__ == "__main__":
-    run_image_demo()
+    main()
